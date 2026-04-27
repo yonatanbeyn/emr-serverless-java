@@ -1,0 +1,128 @@
+name: EMR Serverless Java Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: transaction-analytics-emr-serverless
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+          cache: maven
+
+      - name: Run tests
+        run: mvn test
+
+      - name: Build fat JAR
+        run: mvn clean package -DskipTests
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transaction-analytics-jar
+          path: target/transaction-analytics-*.jar
+          retention-days: 7
+
+  validate-cfn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+      - name: Lint CloudFormation
+        run: cfn-lint infra/emr-serverless.yaml
+
+  deploy:
+    needs: [build-and-test, validate-cfn]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsEMRServerlessRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: transaction-analytics-jar
+          path: target/
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-file infra/emr-serverless.yaml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=prod \
+              DataBucket=${{ secrets.DATA_BUCKET }} \
+            --no-fail-on-empty-changeset
+
+      - name: Upload JAR to S3
+        run: |
+          aws s3 cp target/transaction-analytics-1.0.0.jar \
+            s3://${{ secrets.DATA_BUCKET }}/jars/transaction-analytics-1.0.0.jar
+
+      - name: Get application ID and role ARN from stack outputs
+        id: outputs
+        run: |
+          APP_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ApplicationId'].OutputValue" \
+            --output text)
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='JobRoleArn'].OutputValue" \
+            --output text)
+          echo "app_id=${APP_ID}" >> $GITHUB_OUTPUT
+          echo "role_arn=${ROLE_ARN}" >> $GITHUB_OUTPUT
+
+      - name: Submit EMR Serverless job
+        run: |
+          aws emr-serverless start-job-run \
+            --application-id ${{ steps.outputs.outputs.app_id }} \
+            --execution-role-arn ${{ steps.outputs.outputs.role_arn }} \
+            --name "transaction-analytics-$(date +%Y-%m-%d)" \
+            --job-driver '{
+              "sparkSubmit": {
+                "entryPoint": "s3://${{ secrets.DATA_BUCKET }}/jars/transaction-analytics-1.0.0.jar",
+                "entryPointArguments": [
+                  "s3://${{ secrets.DATA_BUCKET }}/raw/",
+                  "s3://${{ secrets.DATA_BUCKET }}/curated/"
+                ],
+                "sparkSubmitParameters": "--class com.emr.analytics.TransactionAnalytics --conf spark.executor.cores=4 --conf spark.executor.memory=8g"
+              }
+            }' \
+            --configuration-overrides '{
+              "monitoringConfiguration": {
+                "s3MonitoringConfiguration": {
+                  "logUri": "s3://${{ secrets.DATA_BUCKET }}/emr-logs/"
+                }
+              }
+            }'
