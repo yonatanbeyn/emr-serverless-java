@@ -89,6 +89,11 @@ jobs:
           aws s3 cp target/transaction-analytics-1.0.0.jar \
             s3://${{ secrets.DATA_BUCKET }}/jars/transaction-analytics-1.0.0.jar
 
+      - name: Upload sample data to S3
+        run: |
+          aws s3 cp sample-data/transactions.json \
+            s3://${{ secrets.DATA_BUCKET }}/raw/date=$(date +%Y-%m-%d)/transactions.json
+
       - name: Get application ID and role ARN from stack outputs
         id: outputs
         run: |
