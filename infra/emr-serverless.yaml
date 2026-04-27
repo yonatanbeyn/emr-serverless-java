@@ -63,7 +63,7 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                   - logs:DescribeLogStreams
-                Resource: !Sub arn:aws:logs:*:*:/aws/emr-serverless/*
+                Resource: arn:aws:logs:*:*:/aws/emr-serverless/*
 
   EMRServerlessApplication:
     Type: AWS::EMRServerless::Application
